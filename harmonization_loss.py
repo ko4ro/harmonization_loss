@@ -130,5 +130,5 @@ def harmonizer_loss(model, images, tokens, labels, true_heatmaps,
 
     loss = cce_loss + lambda_weights * weight_loss + lambda_harmonization * harmonization_loss
     gradients = torch.autograd.grad(loss, model.parameters())
-
+    assert len(gradients) == len(list(model.parameters())), "Mismatch between gradients and model parameters"
     return gradients

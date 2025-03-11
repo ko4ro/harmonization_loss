@@ -5,20 +5,19 @@ import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as transforms
 import numpy as np
-import matplotlib.pyplot as plt
+import math
+import argparse
+import wandb
+
 from torchvision.datasets import CIFAR10
-import torchvision.utils as vutils
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-import wandb
-import math
 
 from harmonization_loss import standardize_cut, pyramidal_mse_with_tokens
 from blur import gaussian_blur, gaussian_kernel
 
-gaussian_kernel = torch.tensor(gaussian_kernel(), dtype=torch.float32)
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+gaussian_kernel = torch.tensor(gaussian_kernel(), dtype=torch.float32)
 
 class CNNClassifier(nn.Module):
     def __init__(self, num_classes=10):
@@ -83,14 +82,14 @@ def create_composite_image(images):
 
 
 # 【新規追加】CutMix用のランダムなバウンディングボックスを計算する関数
-def rand_bbox(size, lam):
-    # size: [B, C, H, W]
+def rand_bbox(size, lam, seed=None):
+    if seed is not None:
+        np.random.seed(seed)  # シードを固定
     W = size[3]
     H = size[2]
     cut_rat = np.sqrt(1. - lam)
     cut_w = int(W * cut_rat)
     cut_h = int(H * cut_rat)
-    # 中心座標をランダムに選ぶ
     cx = np.random.randint(W)
     cy = np.random.randint(H)
     bbx1 = np.clip(cx - cut_w // 2, 0, W)
@@ -100,22 +99,22 @@ def rand_bbox(size, lam):
     return bbx1, bby1, bbx2, bby2
 
 # 【新規追加】CutMixの処理
-def cutmix_data(x, y, true_heatmaps, alpha=1.0):
+def cutmix_data(x, y, true_heatmaps, alpha=1.0, seed=None):
     lam = np.random.beta(alpha, alpha)
     batch_size = x.size()[0]
     rand_index = torch.randperm(batch_size).to(x.device)
-    bbx1, bby1, bbx2, bby2 = rand_bbox(x.size(), lam)
+    bbx1, bby1, bbx2, bby2 = rand_bbox(x.size(), lam, seed=seed)
     # 指定領域をランダムに入れ替え
     x[:, :, bby1:bby2, bbx1:bbx2] = x[rand_index, :, bby1:bby2, bbx1:bbx2]
      # **true_heatmaps の更新**
     # updated_heatmaps = true_heatmaps.clone()  # 元の true_heatmaps を変更しないようにコピー
-    if (bby2-bby1) * (bbx2-bbx1) >= x.size(2) * x.size(3) / 2:
-        # CutMixした領域を 1 にする
-        true_heatmaps[:, bby1:bby2, bbx1:bbx2] = 1.0
-    else:
+    if (bby2-bby1) * (bbx2-bbx1) >= x.size(2) * x.size(3) // 2:
         # CutMix領域以外を 1 にする（反転する形）
         true_heatmaps = torch.ones_like(true_heatmaps, device=x.device)
         true_heatmaps[:, bby1:bby2, bbx1:bbx2] = 0.0
+    else:
+        true_heatmaps[:, bby1:bby2, bbx1:bbx2] = 1.0
+        # CutMixした領域を 1 にする
     # CutMix によるラベルの混合
     y_a = y
     y_b = y[rand_index]
@@ -132,27 +131,29 @@ def evaluate_model(model, dataloader, criterion, writer, epoch):
         with torch.no_grad():
             if wandb.config["use_cutmix"]:
                 true_heatmaps = torch.zeros((images.size(0), images.size(2), images.size(3))).to(device)
-                images, labels_a, labels_b, lam, true_heatmaps = cutmix_data(images, labels, true_heatmaps, wandb.config["cutmix_alpha"])
+                images, labels_a, labels_b, lam, true_heatmaps = cutmix_data(images, labels, true_heatmaps, wandb.config["cutmix_alpha"], seed=wandb.config["seed"])
                 # forward pass
                 outputs = model(images)
                 loss = lam * criterion(outputs, labels_a) + (1 - lam) * criterion(outputs, labels_b)
                 grad_target = labels_a  if lam >= 0.5 else labels_b # gradloss計算には一方のラベルを用いる
             else:
-                true_heatmaps = create_mask(images.size(0), images.size(2), images.size(3), wandb.config["mask_size"])  # ※通常入力画像サイズに合わせる
+                if wandb.config["use_gradloss"]:
+                    true_heatmaps = create_mask(images, images.size(2), wandb.config["mask_size"])  # ※通常入力画像サイズに合わせる
                 outputs = model(images)
-                loss = criterion(outputs, labels)
                 grad_target = labels
+                loss = criterion(outputs, labels)
 
-        if batch_idx == 0:
+        if batch_idx == 0 and wandb.config["use_gradloss"]:
             images.requires_grad = True
             outputs = model(images)  # 再度 forward pass
             loss_metapred = torch.sum(outputs * F.one_hot(grad_target, num_classes=10), dim=-1)
             sa_maps = torch.autograd.grad(loss_metapred, images, grad_outputs=torch.ones_like(loss_metapred), retain_graph=True)[0]
-            sa_maps = gaussian_blur(sa_maps, gaussian_kernel.to(device))  # ガウシアンフィルタ適用
-            sa_maps = torch.mean(sa_maps, dim=1)
-            sa_maps_preprocess = standardize_cut(sa_maps)
-            heatmaps_preprocess = standardize_cut(true_heatmaps)
-            heatmaps_preprocess = gaussian_blur(heatmaps_preprocess.unsqueeze(1), gaussian_kernel.to(device)).squeeze(1)  # ガウシアンフィルタ適用
+            # sa_maps = gaussian_blur(sa_maps, gaussian_kernel.to(device))  # ガウシアンフィルタ適用
+            sa_maps_preprocess = standardize_cut(sa_maps) * true_heatmaps
+            sa_maps_preprocess = torch.mean(sa_maps_preprocess, dim=1)
+            heatmaps_preprocess = true_heatmaps
+            # heatmaps_preprocess = standardize_cut(true_heatmaps)
+            # heatmaps_preprocess = gaussian_blur(heatmaps_preprocess.unsqueeze(1), gaussian_kernel.to(device)).squeeze(1)  # ガウシアンフィルタ適用
             # WandB に追加
             if wandb.config["use_cutmix"]:
                 wandb.log({
@@ -174,21 +175,9 @@ def evaluate_model(model, dataloader, criterion, writer, epoch):
     writer.add_scalar('Accuracy/Validation', accuracy, epoch)
     print(f'Validation Loss: {val_loss:.4f}, Validation Accuracy: {accuracy:.2f}%')
 
-def main():
-    # wandbの初期化。use_composite: バッチ内先頭以外を0マスクしグリッド画像にする、use_cutmix: CutMixを適用
-    wandb.init(project="cnn-cifar10", config={
-        "epochs": 20,
-        "use_gradloss": True,
-        "use_pyramidal_mse": True,
-        "use_composite": False,    # ← Composite augmentationを使う場合
-        "use_cutmix": True,      # ← CutMixを使う場合はTrueに変更
-        "channel": 3,
-        "mask_size": 16,
-        "batch_size": 512,
-        "learning_rate": 0.001,
-        "alpha": 1.0,
-        "cutmix_alpha": 1.0      # CutMix用パラメータ
-    })
+def main(args):
+    # wandb の初期化
+    wandb.init(project="cnn-cifar10", config=vars(args))
 
     # 両方を同時に使うと意味が衝突するため
     if wandb.config["use_composite"] and wandb.config["use_cutmix"]:
@@ -239,6 +228,7 @@ def main():
     # モデルの学習
     for epoch in range(num_epochs):
         epoch_loss = 0.0
+        epoch_noise_gradient_norm_loss = 0.0
         model.train()
         for batch_idx, (images, labels) in enumerate(dataloader):
             # images, labelsをdeviceへ
@@ -248,15 +238,16 @@ def main():
             if wandb.config["use_cutmix"]:
                 true_heatmaps = torch.zeros((images.size(0), images.size(2), images.size(3))).to(device)
             else:
-                true_heatmaps = create_mask(images.size(0), images.size(2), images.size(3), mask_size)  # ※通常入力画像サイズに合わせる
+                true_heatmaps = create_mask(images, images.size(2), mask_size)  # ※通常入力画像サイズに合わせる
 
             if wandb.config["use_cutmix"]:
                 images, labels_a, labels_b, lam, true_heatmaps = cutmix_data(images, labels, true_heatmaps, wandb.config["cutmix_alpha"])
                 # forward pass
                 images.requires_grad = True
                 outputs = model(images)
-                loss = lam * criterion(outputs, labels_a) + (1 - lam) * criterion(outputs, labels_b)
                 grad_target = labels_a  if lam >= 0.5 else labels_b # gradloss計算には一方のラベルを用いる
+                loss = criterion(outputs, grad_target)
+                # loss = lam * criterion(outputs, labels_a) + (1 - lam) * criterion(outputs, labels_b)
             # elif wandb.config["use_composite"]:
             #     # バッチ内先頭以外を0にマスクし、グリッド画像にまとめる
             #     images = create_composite_image(images)
@@ -282,49 +273,59 @@ def main():
             # 出力とラベルに対してone-hot重み付き和をとり、画像に対する勾配を計算
             loss_metapred = torch.sum(outputs * F.one_hot(grad_target, num_classes=10), dim=-1)
             sa_maps = torch.autograd.grad(loss_metapred, images, grad_outputs=torch.ones_like(loss_metapred), retain_graph=True)[0]
-            sa_maps = gaussian_blur(sa_maps, gaussian_kernel.to(device))  # ガウシアンフィルタ適用
-            sa_maps = torch.mean(sa_maps, dim=1)  # チャンネル方向の平均
+            # sa_maps = gaussian_blur(sa_maps, gaussian_kernel.to(device))  # ガウシアンフィルタ適用
             # 標準化・カット操作（harmonization loss用）
-            sa_maps_preprocess = standardize_cut(sa_maps)
-            heatmaps_preprocess = standardize_cut(true_heatmaps)
+            if wandb.config["use_cutmix"]:
+                sa_maps = torch.mean(sa_maps, dim=1)  # チャンネル方向の平均
+            sa_maps_preprocess = standardize_cut(sa_maps) * true_heatmaps
+            heatmaps_preprocess = true_heatmaps
+            # heatmaps_preprocess = standardize_cut(true_heatmaps)
             # gaussian_kernel = gaussian_kernel().to(device)
-            heatmaps_preprocess = gaussian_blur(heatmaps_preprocess.unsqueeze(1), gaussian_kernel.to(device)).squeeze(1)  # ガウシアンフィルタ適用
-            _sa_max = torch.amax(sa_maps_preprocess.detach(), dim=(1, 2), keepdim=True)[0] + 1e-6
-            _hm_max = torch.amax(heatmaps_preprocess, dim=(1, 2), keepdim=True)[0] + 1e-6
-            heatmaps_preprocess = heatmaps_preprocess / _hm_max * _sa_max
+            # heatmaps_preprocess = gaussian_blur(heatmaps_preprocess.unsqueeze(1), gaussian_kernel.to(device)).squeeze(1)  # ガウシアンフィルタ適用
+            # _sa_max = torch.amax(sa_maps_preprocess.detach(), dim=(1, 2), keepdim=True)[0] + 1e-6
+            # _hm_max = torch.amax(heatmaps_preprocess, dim=(1, 2), keepdim=True)[0] + 1e-6
+            # heatmaps_preprocess = heatmaps_preprocess / _hm_max * _sa_max
             if use_gradloss:
-                if use_pyramidal_mse:
-                    tokens = torch.ones(len(images)).to(device)
-                    harmonization_loss = pyramidal_mse_with_tokens(sa_maps_preprocess, heatmaps_preprocess, tokens)
-                else:
-                    harmonization_loss = F.mse_loss(sa_maps_preprocess, heatmaps_preprocess)
+                # if use_pyramidal_mse:
+                #     tokens = torch.ones(len(images)).to(device)
+                #     harmonization_loss = pyramidal_mse_with_tokens(sa_maps_preprocess, heatmaps_preprocess, tokens)
+                # else:
+                #     harmonization_loss = F.mse_loss(sa_maps_preprocess, heatmaps_preprocess)
                 # total_loss = loss + alpha * harmonization_loss
+                noise_gradient_norm = torch.norm(sa_maps_preprocess, p=2)
+                # noise_gradient_norm = noise_gradient_norm / loss.max()[0] * noise_gradient_norm.max()[0]
                 weight_loss = sum(torch.norm(param, p=2) for name, param in model.named_parameters()
                         if not any(exclude in name for exclude in ['bn', 'normalization', 'embed', 'Norm', 'norm', 'class_token']))
-                total_loss = loss + alpha * harmonization_loss + 1e-5 * weight_loss
+                # alpha = 1e-5
+                lambda_weights = 0
+                total_loss = loss + alpha * noise_gradient_norm * 1e-1 + lambda_weights * weight_loss
+                # total_loss = loss + alpha * harmonization_loss + lambda_weights * weight_loss
             else:
                 total_loss = loss
             # # 5エポックごとに可視化
-            # if (epoch % 5 == 0 or epoch == num_epochs-1) and batch_idx == 0:
-            #     # gaussian_kernel = gaussian_kernel().to(device)
-            #     # sa_maps_preprocess[0] = gaussian_blur(sa_maps_preprocess[0], gaussian_kernel.to(device))  # ガウシアンフィルタ適用
-            #     # WandB に追加
-            #     if wandb.config["use_cutmix"]:
-            #         wandb.log({
-            #             f"CutMix Images": [wandb.Image(images[0], caption=f"Epoch {epoch}")],
-            #         })
-            #     wandb.log({
-            #         f"Saliency Heatmaps": [wandb.Image(sa_maps_preprocess[0:1], caption=f"Epoch {epoch}")],
-            #         f"True Heatmaps": [wandb.Image(heatmaps_preprocess.unsqueeze(1)[0], caption=f"Epoch {epoch}")]
-            #     })
+            if (epoch % 5 == 0 or epoch == num_epochs-1) and batch_idx == 0:
+                # WandB に追加
+                if wandb.config["use_cutmix"]:
+                    wandb.log({
+                        f"CutMix Images": [wandb.Image(images[0], caption=f"Epoch {epoch}")],
+                    })
+                wandb.log({
+                    f"Saliency Heatmaps": [wandb.Image(sa_maps_preprocess[0:1], caption=f"Epoch {epoch}")],
+                    f"True Heatmaps": [wandb.Image(heatmaps_preprocess.unsqueeze(1)[0], caption=f"Epoch {epoch}")]
+                })
             optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()
             epoch_loss += total_loss.item()
+            if use_gradloss:
+                epoch_noise_gradient_norm_loss += noise_gradient_norm.item()
 
         average_loss = epoch_loss / len(dataloader)
+        average__noise_gradient_norm_loss = epoch_noise_gradient_norm_loss / len(dataloader)
         scheduler.step(average_loss)
         wandb.log({"train_loss": average_loss, "lr": optimizer.param_groups[0]['lr'], "epoch": epoch})
+        if use_gradloss:
+            wandb.log({"noise_grad_loss": average__noise_gradient_norm_loss, "lr": optimizer.param_groups[0]['lr'], "epoch": epoch})
         writer.add_scalar("Loss/train", average_loss, epoch)
         print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {average_loss:.4f}, Learning Rate: {optimizer.param_groups[0]['lr']:.6f}")
         if epoch % 5 == 0 or epoch == num_epochs-1:
@@ -332,5 +333,28 @@ def main():
     writer.close()
     wandb.finish()
 
+# コマンドライン引数の設定
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Train a CNN on CIFAR-10 with configurable options.")
+
+    # 基本ハイパーパラメータ
+    parser.add_argument("--epochs", type=int, default=50, help="Number of epochs for training.")
+    parser.add_argument("--batch_size", type=int, default=1024, help="Batch size for training.")
+    parser.add_argument("--learning_rate", type=float, default=0.0005, help="Learning rate.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
+    parser.add_argument("--channel", type=int, choices=[1, 3], default=3, help="Number of channels (1 for grayscale, 3 for RGB).")
+
+    # Augmentation オプション
+    parser.add_argument("--use_gradloss", action="store_true", help="Use gradient-based loss.")
+    parser.add_argument("--use_pyramidal_mse", action="store_true", help="Use pyramidal MSE loss.")
+    parser.add_argument("--use_composite", action="store_true", help="Apply composite image masking augmentation.")
+    parser.add_argument("--use_cutmix", action="store_true", help="Use CutMix augmentation.")
+
+    # その他のパラメータ
+    parser.add_argument("--mask_size", type=int, default=16, help="Mask size for augmentation.")
+    parser.add_argument("--alpha", type=float, default=1.0, help="Weight for harmonization loss.")
+    parser.add_argument("--cutmix_alpha", type=float, default=1.0, help="CutMix interpolation parameter.")
+
+    args = parser.parse_args()
+    main(args)
+
